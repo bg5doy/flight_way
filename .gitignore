@@ -1,0 +1,54 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行期产物 ----
+# 航班数据库（程序运行时自动创建）
+hfdl_flights.db
+hfdl_flights.db-shm
+hfdl_flights.db-wal
+*.sqlite
+*.sqlite3
+
+# ---- 大体积 / 可再生的数据 ----
+# 接收机音频与 SDR 的 I/Q 录制（请自行录制；单文件常达数百 MB）
+*.wav
+*.cs16
+*.cf32
+*.cu8
+
+# 诊断生成的图片
+*_analysis.png
+*_spectrum.png
+_crop*.png
+screen_*.png
+app_window.png
+icon_*.png
+
+# ---- OpenHFDL：只保留上游源码压缩包，其余为可再生的解压/构建产物 ----
+openhfdl/*
+!openhfdl/*.tar.gz
+
+# ---- 本机专用的 SDRuno 自动化脚本（与 HFDL 解码无关）----
+_click.ps1
+_shot.ps1
+_top.ps1
+crop.py
+list_all_devices.py
+
+# ---- 本机网络受限时的推送工具（含令牌，不入库）----
+gh_push.py
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# ��������ʱ���������ͽű�������ר�ã�
+_watch_push.py
+

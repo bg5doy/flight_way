@@ -1,0 +1,9 @@
+# 解码后端无需额外 Python 包：
+#   · 通过子进程调用 dumphfdl（本机 / WSL），经 stdout / TCP 读取 JSON / Basestation
+#   · 仅使用 Python 标准库（subprocess / socket / json / sqlite3）
+#
+# 以下依赖用于 GUI 显示与声卡 → I/Q 桥接：
+numpy>=1.24          # 信号处理、地图几何计算
+scipy>=1.10          # 希尔伯特解析变换（声卡音频 → I/Q）、频谱分析
+matplotlib>=3.6      # 全球矢量地图
+sounddevice>=0.4.6   # 声卡 / 虚拟声卡采集（SDRuno IQ OUT 等）

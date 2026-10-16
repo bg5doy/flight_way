@@ -1,0 +1,19 @@
+# 换行符统一：Shell / Python / 配置一律 LF
+# （若 .sh 被检出为 CRLF，Linux / WSL 下 bash 会直接报错）
+* text=auto eol=lf
+
+# Windows 专用脚本保留 CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件不做换行转换
+*.tar.gz binary
+*.wav    binary
+*.cs16   binary
+*.cf32   binary
+*.cu8    binary
+*.png    binary
+*.db     binary
+*.geojson text eol=lf
+*.conf    text eol=lf
