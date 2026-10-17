@@ -24,6 +24,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.patches as mpatches
 from matplotlib.collections import LineCollection
 
+from flight_id import display_flight_id
+
 # 航迹最多保留 16 小时（界面可调，但不超过此值）
 TRACK_MAX_MIN = 16 * 60
 
@@ -206,18 +208,22 @@ class WorldMap:
     MIN_SPAN = 0.8
     MAX_SPAN = 360.0
 
-    def __init__(self, parent, geojson_path):
+    def __init__(self, parent, geojson_path, on_click=None):
         self.parent = parent
+        self.on_click = on_click       # 在地图上单击（非拖拽）时回调
         self.flights = {}
         self.stale_sec = 3600
         self.track_min = 120            # 航迹保留分钟数（≤ TRACK_MAX_MIN）
         self.show_tracks = True
         self.show_labels = "auto"       # True / False / "auto"
         self.icon_base_px = 15.0        # 全球视图下的图标像素尺寸
+        self.selected_key = None        # 列表中被选中的航班（高亮显示）
+        self.flight_id_mode = "iata"    # 航班号显示模式：iata（默认）/ raw / both
         self._dyn = []                  # 本帧动态 artists
         self._polys = []
         self._drag = None               # 拖拽起点（像素坐标）
         self._drag_ref = None           # 拖拽起点时的 (xlim, ylim, 画布宽, 高)
+        self._drag_moved = False        # 本次按下是否发生过拖拽（用于区分单击）
 
         self.fig = Figure(figsize=(11, 5.6), dpi=100, facecolor="#0a1b2c")
         self.ax = self.fig.add_subplot(111)
@@ -312,6 +318,7 @@ class WorldMap:
         """记录拖拽起点：像素坐标 + 当时的坐标范围与画布尺寸。"""
         if ev.inaxes is self.ax and ev.button == 1 and ev.x is not None:
             self._drag = (ev.x, ev.y)
+            self._drag_moved = False
             self._drag_ref = (tuple(self._xlim), tuple(self._ylim),
                               max(float(self.ax.bbox.width), 1.0),
                               max(float(self.ax.bbox.height), 1.0))
@@ -321,16 +328,28 @@ class WorldMap:
                 pass
 
     def _on_release(self, ev):
+        # 按下到松开之间若几乎没移动，视为「单击」而不是拖拽
+        was_press = self._drag_ref is not None
+        moved = self._drag_moved
         self._drag = None
         self._drag_ref = None
+        self._drag_moved = False
         try:
             self.canvas.get_tk_widget().configure(cursor="")
         except Exception:
             pass
+        if was_press and not moved and self.on_click is not None:
+            try:
+                self.on_click()
+            except Exception:
+                pass
 
     def _on_move(self, ev):
         if self._drag is None or self._drag_ref is None or ev.x is None:
             return
+        # 超过 4px 才算拖拽，避免手抖把单击变成平移、或把平移当成单击
+        if (abs(ev.x - self._drag[0]) > 4 or abs(ev.y - self._drag[1]) > 4):
+            self._drag_moved = True
         (x0, x1), (y0, y1), w, h = self._drag_ref
         # 像素位移 -> 数据位移（范围取拖拽开始时的快照，避免反馈）
         dx = (ev.x - self._drag[0]) / w * (x1 - x0)
@@ -381,6 +400,32 @@ class WorldMap:
 
     def set_icon_size(self, px):
         self.icon_base_px = float(np.clip(float(px), 6.0, 40.0))
+
+    def set_selected(self, key):
+        """设置高亮航班（None 表示取消高亮）。key 为 FlightState.key。"""
+        self.selected_key = key
+
+    def set_flight_id_mode(self, mode):
+        """航班号显示模式：iata=转 IATA 码（默认）/ raw=报文原文 / both=两者。"""
+        self.flight_id_mode = mode if mode in ("raw", "iata", "both") else "iata"
+
+    def center_on(self, key, span=None):
+        """把视野移到指定航班（可选指定经度跨度）。"""
+        st = self.flights.get(key)
+        if st is None or st.lat is None:
+            return False
+        if span is None:
+            span = self._xlim[1] - self._xlim[0]
+        span = float(np.clip(span, self.MIN_SPAN, self.MAX_SPAN))
+        # 维持当前纵横比
+        cur_x = self._xlim[1] - self._xlim[0]
+        cur_y = self._ylim[1] - self._ylim[0]
+        ratio = (cur_y / cur_x) if cur_x else 0.5
+        sy = span * ratio
+        self._xlim = (st.lon - span / 2, st.lon + span / 2)
+        self._ylim = (st.lat - sy / 2, st.lat + sy / 2)
+        self._apply()
+        return True
 
     def upsert(self, fr):
         key = fr.key()
@@ -436,8 +481,11 @@ class WorldMap:
         """仅机体外形（供测试/兼容）。"""
         return self._rotate(AIRCRAFT_OUTLINE, lon, lat, heading, dx, dy)
 
-    def _draw_track(self, st, now, window, sx):
-        """航迹：按时间渐变（越旧越淡），跨 180° 经线不连线。"""
+    def _draw_track(self, st, now, window, sx, highlight=False):
+        """航迹：按时间渐变（越旧越淡），跨 180° 经线不连线。
+
+        highlight=True 时用更亮的琥珀色 + 更粗线宽，并压在其它航迹之上。
+        """
         pts = st.track
         if len(pts) < 2:
             return
@@ -447,36 +495,45 @@ class WorldMap:
                 continue
             segs.append([(lo1, la1), (lo2, la2)])
             age = (now - t2) / window if window > 0 else 1.0
-            a = float(np.clip(0.85 - 0.70 * age, 0.10, 0.85))
-            cols.append((1.0, 0.72, 0.02, a))
+            if highlight:
+                a = float(np.clip(0.98 - 0.40 * age, 0.50, 0.98))
+                cols.append((1.0, 0.80, 0.20, a))
+            else:
+                a = float(np.clip(0.85 - 0.70 * age, 0.10, 0.85))
+                cols.append((1.0, 0.72, 0.02, a))
         if not segs:
             return
-        lc = LineCollection(segs, colors=cols, linewidths=1.2, zorder=3,
-                            capstyle="round")
+        lc = LineCollection(segs, colors=cols,
+                            linewidths=(2.8 if highlight else 1.2),
+                            zorder=(5 if highlight else 3), capstyle="round")
         self.ax.add_collection(lc)
         self._dyn.append(lc)
-        # 起点小圆点（半径按**像素**计，约 2.5px），标示航迹起始
+        # 起点小圆点（半径按**像素**计），标示航迹起始
         t0, la0, lo0 = pts[0]
-        dot = mpatches.Circle((lo0, la0), 2.5 * sx, facecolor="none",
-                              edgecolor="#ffb703", lw=0.9, alpha=0.7, zorder=3)
+        dot = mpatches.Circle(
+            (lo0, la0), (3.6 if highlight else 2.5) * sx, facecolor="none",
+            edgecolor=("#ffd166" if highlight else "#ffb703"),
+            lw=(1.8 if highlight else 0.9),
+            alpha=(1.0 if highlight else 0.7),
+            zorder=(5 if highlight else 3))
         self.ax.add_patch(dot)
         self._dyn.append(dot)
 
-    @staticmethod
-    def _label_text(st):
-        """标签：航班号 + （航向 / 高度，有则显示）。"""
+    def _label_text(self, st):
+        """标签：航班号 + （航向 / 高度，有则显示）。航班号按显示模式选择。"""
         line2 = []
         if st.heading is not None and st.heading_src == "track":
             line2.append(f"{st.heading:03.0f}°")
         if st.altitude:
             line2.append(f"FL{int(st.altitude) // 100:03d}")
-        return (st.flight or st.key) + ("\n" + " ".join(line2) if line2 else "")
+        name = display_flight_id(st.flight, self.flight_id_mode)
+        return name + ("\n" + " ".join(line2) if line2 else "")
 
-    def _place_label(self, st, dx, dy, sx, sy, placed):
-        """放置航班标签：带避让，重叠则跳过。"""
+    def _place_label(self, st, dx, dy, sx, sy, placed, highlight=False):
+        """放置航班标签：带避让，重叠则跳过（高亮的标签优先放置且不参与避让放弃）。"""
         tag = self._label_text(st)
         lines = tag.split("\n")
-        fs = 7.0
+        fs = 7.5 if highlight else 7.0
         w = max(len(s) for s in lines) * fs * 0.60 * sx
         h = len(lines) * fs * 1.35 * sy
         tx = st.lon + dx * 1.4
@@ -484,12 +541,20 @@ class WorldMap:
         box = (tx - w / 2, ty - h, tx + w / 2, ty + h)
         for (bx0, by0, bx1, by1) in placed:
             if not (box[2] < bx0 or box[0] > bx1 or box[3] < by0 or box[1] > by1):
-                return False
+                if not highlight:
+                    return False
         placed.append(box)
-        t = self.ax.text(tx, ty, tag, color="#d8f6ff", fontsize=fs, zorder=7,
-                         ha="center", va="bottom", linespacing=1.15,
-                         bbox=dict(boxstyle="round,pad=0.20", fc="#062033",
-                                   ec="#2f6f95", lw=0.5, alpha=0.72))
+        if highlight:
+            t = self.ax.text(tx, ty, tag, color="#fff3d0", fontsize=fs, zorder=10,
+                             ha="center", va="bottom", linespacing=1.15,
+                             fontweight="bold",
+                             bbox=dict(boxstyle="round,pad=0.25", fc="#4a3200",
+                                       ec="#ffd166", lw=1.2, alpha=0.95))
+        else:
+            t = self.ax.text(tx, ty, tag, color="#d8f6ff", fontsize=fs, zorder=7,
+                             ha="center", va="bottom", linespacing=1.15,
+                             bbox=dict(boxstyle="round,pad=0.20", fc="#062033",
+                                       ec="#2f6f95", lw=0.5, alpha=0.72))
         self._dyn.append(t)
         return True
 
@@ -517,10 +582,17 @@ class WorldMap:
                and (x0 - 5.0 <= st.lon <= x1 + 5.0)
                and (y0 - 5.0 <= st.lat <= y1 + 5.0)]
 
+        sel = self.selected_key
+        # 选中的排在最后绘制（配合 zorder 保证压在最上层）
+        ordered = [s for s in vis if s.key != sel]
+        sel_st = next((s for s in vis if s.key == sel), None)
+        if sel_st is not None:
+            ordered.append(sel_st)
+
         # ---- 航迹（画在图标下面）----
         if self.show_tracks:
-            for st in vis:
-                self._draw_track(st, now, window, sx)
+            for st in ordered:
+                self._draw_track(st, now, window, sx, highlight=(st.key == sel))
 
         # ---- 标签显隐策略 ----
         mode = self.show_labels
@@ -532,28 +604,42 @@ class WorldMap:
             show_lbl = (len(vis) <= 14) or ((x1 - x0) < 60.0)
 
         # ---- 飞机图标 ----
-        half = self.icon_size_px() / 2.0
-        dx, dy = half * sx, half * sy
+        base_half = self.icon_size_px() / 2.0
         placed = []
-        for st in sorted(vis, key=lambda s: (-(s.last_seen), s.key)):
+        # 有选中项时，其余适当压暗，突出高亮目标
+        dim = 0.45 if sel_st is not None else 1.0
+        for st in ordered:
+            is_sel = (st.key == sel)
+            half = base_half * (1.45 if is_sel else 1.0)
+            dx, dy = half * sx, half * sy
             age = (now - st.last_seen) / max(self.stale_sec, 1)
-            fresh = float(np.clip(1.0 - age, 0.35, 1.0))
+            fresh = float(np.clip(1.0 - age, 0.35, 1.0)) * (1.0 if is_sel else dim)
+            if is_sel:
+                # 高亮光环
+                self._dyn.append(self._add(mpatches.Circle(
+                    (st.lon, st.lat), half * 1.75 * sx, facecolor="none",
+                    edgecolor="#ffd166", lw=1.4, ls=(0, (3, 2)), alpha=0.95,
+                    zorder=8)))
             if st.heading is None:
                 # 航向未知：中空圆环 + 圆心，明确区别于"朝北"
+                ec = "#ffd166" if is_sel else "#7fe3ff"
                 self._dyn.append(self._add(mpatches.Circle(
                     (st.lon, st.lat), half * sx, facecolor="none",
-                    edgecolor="#7fe3ff", lw=1.0, zorder=6)))
+                    edgecolor=ec, lw=(1.6 if is_sel else 1.0), zorder=9 if is_sel else 6)))
                 self._dyn.append(self._add(mpatches.Circle(
-                    (st.lon, st.lat), half * sx * 0.30, facecolor="#7fe3ff",
-                    edgecolor="none", zorder=6)))
+                    (st.lon, st.lat), half * sx * 0.30, facecolor=ec,
+                    edgecolor="none", zorder=9 if is_sel else 6)))
             else:
+                fc = ((1.0, 0.82, 0.30, 1.0) if is_sel
+                      else (0.0, 0.90 * fresh, 1.0, 0.95 * dim))
                 for poly in self._plane_polys(st.lon, st.lat, st.heading, dx, dy):
                     self._dyn.append(self._add(mpatches.Polygon(
-                        poly, closed=True,
-                        facecolor=(0.0, 0.90 * fresh, 1.0, 0.95),
-                        edgecolor="#eaffff", linewidth=0.5, zorder=6)))
-            if show_lbl:
-                self._place_label(st, dx, dy, sx, sy, placed)
+                        poly, closed=True, facecolor=fc,
+                        edgecolor=("#ffffff" if is_sel else "#eaffff"),
+                        linewidth=(1.0 if is_sel else 0.5),
+                        zorder=9 if is_sel else 6)))
+            if show_lbl or is_sel:
+                self._place_label(st, dx, dy, sx, sy, placed, highlight=is_sel)
 
         self.canvas.draw_idle()
 

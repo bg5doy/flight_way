@@ -25,7 +25,7 @@ import random
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -33,18 +33,34 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from config import (HfdlConfig, BACKEND_OPENHFDL_LOCAL, BACKEND_OPENHFDL_SOUNDCARD,
-                    BACKEND_OPENHFDL_REMOTE, BACKEND_LABELS, HFDL_SYMBOL_RATE)
+                    BACKEND_OPENHFDL_REMOTE, BACKEND_OPENHFDL_RSP,
+                    BACKEND_LABELS, HFDL_SYMBOL_RATE)
 import audio as aud
 import hfdl_presets as presets
 import openhfdl_client as ohc
+import sdr_rsp as rsp
 import soundcard_bridge as scb
 import worldmap
+from flight_id import display_flight_id
 from store import FlightStore
 from worldmap import WorldMap
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 GEOJSON = os.path.join(BASE, "world_ne110m.geojson")
 DB_PATH = os.path.join(BASE, "hfdl_flights.db")
+
+
+def _fmt_utc(ts):
+    """把 epoch 秒格式化成 UTC 的 HH:MM:SS。
+
+    HFDL 全线用 UTC（dumphfdl 的输出也是 UTC），所以列表里也按 UTC 显示，
+    避免与本地时区混淆；表头已标注 "(UTC)"。
+    """
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc) \
+            .strftime("%H:%M:%S")
+    except Exception:
+        return "—"
 
 
 class HFDLApp:
@@ -69,6 +85,11 @@ class HFDLApp:
         self.worker = None
         self.frame_q = queue.Queue()     # 解码线程 -> Tk 线程
         self.log_q = queue.Queue()
+        self._tree_keys = []             # 飞机列表当前的主键顺序（避免每秒重建）
+        self._last_map_draw = 0.0        # 上次地图重绘时刻（无新帧时降低重绘频率）
+        # 航班号显示模式的**唯一真源**：地图标签与飞机列表都读这个值，
+        # 切换下拉框即时生效（不必先点「应用参数」），避免两处显示不一致。
+        self._fid_mode = getattr(self.cfg, "flight_id_mode", "iata")
 
         self._build_ui()
         self._setup_map()
@@ -148,7 +169,7 @@ class HFDLApp:
         cmb = ttk.Combobox(f0, textvariable=self.var_backend, width=36, state="readonly",
                            values=[BACKEND_LABELS[k] for k in
                                    (BACKEND_OPENHFDL_LOCAL, BACKEND_OPENHFDL_SOUNDCARD,
-                                    BACKEND_OPENHFDL_REMOTE)])
+                                    BACKEND_OPENHFDL_RSP, BACKEND_OPENHFDL_REMOTE)])
         cmb.pack(fill="x")
         cmb.bind("<<ComboboxSelected>>", lambda e: self._on_backend_change())
         self.lbl_oh = ttk.Label(f0, text="检测中…", foreground="#a60", wraplength=255,
@@ -321,6 +342,97 @@ class HFDLApp:
                                   lambda e: self._update_bridge_hint())
         self._on_source_change()
 
+        # ---------- SDRplay RSP 直采 I/Q ----------
+        self.frm_rsp = ttk.LabelFrame(
+            outer, text="SDRplay RSP 直采（SDRplay API，I/Q）", padding=8)
+        self.frm_rsp.pack(fill="x", pady=(6, 0))
+        rp = self.frm_rsp
+
+        ttk.Label(rp, text="设备:").grid(row=0, column=0, sticky="w", pady=2)
+        fr_rdev = ttk.Frame(rp)
+        fr_rdev.grid(row=0, column=1, sticky="ew", pady=2)
+        self.rsp_devices = []                 # [(index, hw_name, serial)]
+        self.var_rsp_dev = tk.StringVar(value="（点「刷新」枚举设备）")
+        self.cmb_rsp_dev = ttk.Combobox(fr_rdev, textvariable=self.var_rsp_dev,
+                                        width=15, state="readonly",
+                                        values=[self.var_rsp_dev.get()])
+        self.cmb_rsp_dev.pack(side="left", fill="x", expand=True)
+        ttk.Button(fr_rdev, text="刷新", width=5,
+                   command=self.refresh_rsp_devices).pack(side="left", padx=(3, 0))
+
+        ttk.Label(rp, text="中心频率 (kHz):").grid(row=1, column=0, sticky="w", pady=2)
+        self.var_rsp_freq = tk.StringVar(value=str(self.cfg.rsp_freq_khz))
+        ttk.Entry(rp, textvariable=self.var_rsp_freq, width=15).grid(
+            row=1, column=1, sticky="ew", pady=2)
+
+        ttk.Label(rp, text="采样率:").grid(row=2, column=0, sticky="w", pady=2)
+        self.var_rsp_rate = tk.StringVar(value=str(self.cfg.rsp_rate))
+        ttk.Combobox(rp, textvariable=self.var_rsp_rate, width=15, state="readonly",
+                     values=[str(f) for f in rsp.FS_OPTIONS]).grid(
+            row=2, column=1, sticky="ew", pady=2)
+
+        ttk.Label(rp, text="中频模式 (IF):").grid(row=3, column=0, sticky="w", pady=2)
+        self._rsp_if_choices = {0: "Zero-IF（推荐 HF）", 450: "450 kHz",
+                                1620: "1620 kHz", 2048: "2048 kHz"}
+        self.var_rsp_if = tk.StringVar(
+            value=self._rsp_if_choices.get(self.cfg.rsp_if_khz,
+                                           "Zero-IF（推荐 HF）"))
+        ttk.Combobox(rp, textvariable=self.var_rsp_if, width=15, state="readonly",
+                     values=list(self._rsp_if_choices.values())).grid(
+            row=3, column=1, sticky="ew", pady=2)
+
+        ttk.Label(rp, text="模拟带宽:").grid(row=4, column=0, sticky="w", pady=2)
+        self.var_rsp_bw = tk.StringVar(value=str(self.cfg.rsp_bw_khz))
+        ttk.Combobox(rp, textvariable=self.var_rsp_bw, width=15, state="readonly",
+                     values=[str(b) for b in rsp.BW_OPTIONS]).grid(
+            row=4, column=1, sticky="ew", pady=2)
+
+        ttk.Label(rp, text="AGC 模式:").grid(row=5, column=0, sticky="w", pady=2)
+        self.var_rsp_agc = tk.StringVar(
+            value={v: k for k, v in rsp.AGC_OPTIONS.items()}.get(
+                self.cfg.rsp_agc, "50 Hz"))
+        ttk.Combobox(rp, textvariable=self.var_rsp_agc, width=15, state="readonly",
+                     values=list(rsp.AGC_OPTIONS)).grid(
+            row=5, column=1, sticky="ew", pady=2)
+
+        ttk.Label(rp, text="增益 gRdB:").grid(row=6, column=0, sticky="w", pady=2)
+        self.var_rsp_gr = tk.StringVar(value=str(self.cfg.rsp_gain_gr))
+        ttk.Spinbox(rp, textvariable=self.var_rsp_gr, from_=20, to=59, width=15).grid(
+            row=6, column=1, sticky="ew", pady=2)
+        ttk.Label(rp, text="LNA 状态:").grid(row=7, column=0, sticky="w", pady=2)
+        self.var_rsp_lna = tk.StringVar(value=str(self.cfg.rsp_lna))
+        ttk.Spinbox(rp, textvariable=self.var_rsp_lna, from_=0, to=27, width=15).grid(
+            row=7, column=1, sticky="ew", pady=2)
+
+        ttk.Label(rp, text="天线口:").grid(row=8, column=0, sticky="w", pady=2)
+        self.var_rsp_ant = tk.StringVar(
+            value={-1: "默认", 0: "A", 1: "B", 2: "C"}.get(
+                self.cfg.rsp_antenna, "默认"))
+        ttk.Combobox(rp, textvariable=self.var_rsp_ant, width=15, state="readonly",
+                     values=["默认", "A", "B", "C"]).grid(
+            row=8, column=1, sticky="ew", pady=2)
+
+        self.var_rsp_bias = tk.BooleanVar(value=bool(self.cfg.rsp_bias_t))
+        ttk.Checkbutton(rp, text="偏置 T 供电（给有源天线）",
+                        variable=self.var_rsp_bias).grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=2)
+
+        ttk.Label(rp, text="硬件抽取:").grid(row=11, column=0, sticky="w", pady=2)
+        self.var_rsp_decim = tk.StringVar(value=str(self.cfg.rsp_decim))
+        ttk.Combobox(rp, textvariable=self.var_rsp_decim, width=15, state="readonly",
+                     values=[str(d) for d in rsp.DECIM_OPTIONS]).grid(
+            row=11, column=1, sticky="ew", pady=2)
+
+        ttk.Button(rp, text="⚡ 按当前波段自动优化（中心频率+带宽+抽取）",
+                   command=self.auto_tune_rsp).grid(
+            row=12, column=0, columnspan=2, sticky="ew", pady=(4, 2))
+
+        self.lbl_rsp = ttk.Label(rp, text="", foreground="#567", wraplength=260,
+                                 justify="left")
+        self.lbl_rsp.grid(row=13, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._update_rsp_hint()
+        self.refresh_rsp_devices(silent=True)
+
         # ---------- 应用参数 ----------
         fa = ttk.LabelFrame(outer, text="应用 / 地图显示", padding=8)
         fa.pack(fill="x", pady=(6, 0))
@@ -358,8 +470,30 @@ class HFDLApp:
         ttk.Spinbox(fa, textvariable=self.var_icon, from_=6, to=40, increment=2,
                     width=8).grid(row=5, column=1, sticky="ew", pady=2)
 
+        # 航班号显示模式（HFDL 的 flight_id 与商业航班号并不相同）
+        ttk.Label(fa, text="航班号显示:").grid(row=6, column=0, sticky="w", pady=2)
+        self._fid_choices = {
+            "商业航班号 (IATA)": "iata",
+            "HFDL 原始 ID": "raw",
+            "两者都显示": "both",
+        }
+        cur_fid = {v: k for k, v in self._fid_choices.items()}.get(
+            self.cfg.flight_id_mode, "商业航班号 (IATA)")
+        self.var_fid_mode = tk.StringVar(value=cur_fid)
+        cmb_fid = ttk.Combobox(fa, textvariable=self.var_fid_mode, width=12,
+                               state="readonly", values=list(self._fid_choices))
+        cmb_fid.grid(row=6, column=1, sticky="ew", pady=2)
+        cmb_fid.bind("<<ComboboxSelected>>", lambda e: self._preview_fid_mode())
+        self.lbl_fid = ttk.Label(fa, text="", foreground="#567", wraplength=250,
+                                 justify="left")
+        self.lbl_fid.grid(row=7, column=0, columnspan=2, sticky="w")
+        self._preview_fid_mode()
+
         ttk.Button(fa, text="应用参数", command=self.apply_cfg).grid(
-            row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+            row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        # 面板控件全部创建完再递归绑定滚轮 —— 否则后建的控件收不到滚轮事件
+        self._bind_wheel(self.cfg_canvas)
 
     # ------------------------------------------------------------------
     def _bind_wheel(self, canvas):
@@ -385,8 +519,21 @@ class HFDLApp:
         self.map_host.pack(fill="both", expand=True)
 
     def _setup_map(self):
-        self.map = WorldMap(self.map_host, GEOJSON)
+        self.map = WorldMap(self.map_host, GEOJSON, on_click=self._on_map_click)
         self._apply_map_prefs()
+
+    def _on_map_click(self):
+        """在地图上单击（非拖拽）-> 取消高亮。"""
+        if not self.tree.selection() and self.map.selected_key is None:
+            return
+        self.map.set_selected(None)
+        try:
+            self.tree.selection_remove(*self.tree.selection())
+        except Exception:
+            pass
+        self._apply_tree_highlight()
+        self.map.refresh()
+        self.log("[map] 已取消航班高亮")
 
     # ------------------------------------------------------------------
     def _build_bottom(self, parent):
@@ -403,18 +550,25 @@ class HFDLApp:
         sb.pack(side="right", fill="y")
         self.txt_log.configure(yscrollcommand=sb.set)
 
-        acf = ttk.LabelFrame(frm, text="当前飞机", padding=4)
+        acf = ttk.LabelFrame(frm, text="当前飞机（选中→地图高亮；双击→地图居中）",
+                             padding=4)
         acf.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        cols = ("flight", "reg", "pos", "alt", "hdg", "seen")
+        cols = ("flight", "raw", "reg", "pos", "alt", "hdg", "seen")
         self.tree = ttk.Treeview(acf, columns=cols, show="headings", height=9)
-        for c, w, t in [("flight", 70, "航班"), ("reg", 70, "注册"), ("pos", 150, "位置"),
-                        ("alt", 55, "高度"), ("hdg", 50, "航向"), ("seen", 65, "秒前")]:
+        for c, w, t in [("flight", 78, "航班(IATA)"), ("raw", 82, "报文原始代码"),
+                        ("reg", 66, "注册"), ("pos", 132, "位置"),
+                        ("alt", 50, "高度"), ("hdg", 44, "航向"),
+                        ("seen", 92, "最新帧 (UTC)")]:
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(side="left", fill="both", expand=True)
         tsb = ttk.Scrollbar(acf, orient="vertical", command=self.tree.yview)
         tsb.pack(side="right", fill="y")
         self.tree.configure(yscrollcommand=tsb.set)
+        # 选中行 -> 地图高亮；双击 -> 地图居中
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Double-1>", self._on_tree_activate)
+        self.tree.tag_configure("sel", background="#5a3d00", foreground="#ffe9a8")
 
     # ==================================================================
     # 辅助
@@ -498,16 +652,20 @@ class HFDLApp:
         """按后端高亮/灰化对应面板，避免选错参数区。"""
         bk = self.cfg.backend
         uses_oh = bk in (BACKEND_OPENHFDL_LOCAL, BACKEND_OPENHFDL_REMOTE)
+        uses_rsp = bk == BACKEND_OPENHFDL_RSP
         self._set_panel_state(self.frm_oh, uses_oh)
         self._set_panel_state(self.frm_bridge, bk == BACKEND_OPENHFDL_SOUNDCARD)
-        # 面板标题加标记，指明当前生效项
+        self._set_panel_state(self.frm_rsp, uses_rsp)
         marks = {
             id(self.frm_oh): uses_oh,
             id(self.frm_bridge): bk == BACKEND_OPENHFDL_SOUNDCARD,
+            id(self.frm_rsp): uses_rsp,
         }
         for frm, base in ((self.frm_oh, "OpenHFDL 参数（I/Q 文件回放）"),
                           (self.frm_bridge,
-                           "信号桥接（OpenHFDL 用声卡 / SDR IQ OUT）")):
+                           "信号桥接（OpenHFDL 用声卡 / SDR IQ OUT）"),
+                          (self.frm_rsp,
+                           "SDRplay RSP 直采（SDRplay API，I/Q）")):
             active = marks.get(id(frm), False)
             frm.configure(text=("▶ " + base) if active else base)
 
@@ -683,10 +841,249 @@ class HFDLApp:
             self.cfg.label_mode = self._label_choices.get(
                 self.var_label_mode.get(), "auto")
             self.cfg.icon_px = float(self.var_icon.get())
+            self.cfg.flight_id_mode = self._fid_choices.get(
+                self.var_fid_mode.get(), "iata")
+            self._fid_mode = self.cfg.flight_id_mode      # 保持显示真源同步
+            self._read_rsp_cfg()                          # SDRplay RSP 参数
             return True
         except Exception as e:
             messagebox.showerror("参数错误", f"参数解析失败：{e}")
             return False
+
+    def _preview_fid_mode(self):
+        """切换航班号显示模式：地图标签与飞机列表**同时**立即生效。
+
+        注意：这里改的是 self._fid_mode（显示用的唯一真源），
+        cfg 只在点「应用参数」时才落盘。
+        """
+        mode = self._fid_choices.get(self.var_fid_mode.get(), "iata")
+        self._fid_mode = mode
+        try:
+            self.map.set_flight_id_mode(mode)
+            self.map.refresh()
+        except Exception:
+            pass
+        # 列表同步重绘（用新模式重建行文本）
+        try:
+            self._tree_keys = []
+            self._refresh_tree()
+        except Exception:
+            pass
+        demo = ("CA1704", "MU5104", "CCA981")
+        out = " / ".join(display_flight_id(d, mode) for d in demo)
+        self.lbl_fid.config(
+            text=f"示例：{out}\n"
+                 f"HFDL 字段上限 6 字符：ICAO 三字码最多带 3 位数字，"
+                 f"4 位航班号只在 IATA 形式下完整")
+
+    # ------------------------------------------------------------------
+    # SDRplay RSP
+    # ------------------------------------------------------------------
+    def refresh_rsp_devices(self, silent=False):
+        """枚举 RSP 设备并填入下拉框。"""
+        try:
+            devs, note = rsp.list_devices()
+        except Exception as e:
+            devs, note = [], f"枚举异常: {e}"
+        self.rsp_devices = devs
+        if devs:
+            names = [f"[{d['index']}] {d['hw_name']} {d['serial']}" for d in devs]
+            self.cmb_rsp_dev.configure(values=names)
+            idx = min(self.cfg.rsp_device_index, len(names) - 1)
+            self.var_rsp_dev.set(names[idx])
+            if not silent:
+                self.log(f"[rsp] 发现 {len(devs)} 台: {', '.join(names)}")
+        else:
+            self.cmb_rsp_dev.configure(values=["（未发现 RSP 设备）"])
+            self.var_rsp_dev.set("（未发现 RSP 设备）")
+            if not silent:
+                self.log("[rsp] " + (note or "未发现设备").replace("\n", " "))
+        self._update_rsp_hint(note)
+        return devs
+
+    def _suggest_center(self, fc):
+        """找不到频道时，建议最接近的波段及其推荐中心频率。"""
+        try:
+            bands = presets.band_channels()
+        except Exception:
+            return None, None
+        best = None
+        for name, ch in bands:
+            if not ch:
+                continue
+            mid = (ch[0] + ch[-1]) / 2.0
+            dist = min(abs(fc - ch[0]), abs(fc - ch[-1]), abs(fc - mid))
+            if best is None or dist < best[0]:
+                best = (dist, name, presets.recommend_center_khz(ch))
+        if best is None:
+            return None, None
+        return best[1], best[2]
+
+    def _rsp_pick_channels(self, fc, half):
+        """按中心频率挑出落在采样带宽内的 HFDL 频道。
+
+        关键：**频道要跟着波段走**。若用户把中心频率调到 21.9 MHz，
+        而频道预设还是 8.9 MHz 段，就一个都落不进去（此前的 bug）。
+
+        挑选规则：
+          1. 窗口内的「频道预设」频道 —— 用户显式选定，必定包含
+          2. 并上窗口内的「全波段系统表」频道 —— 补齐预设缺失的频道
+             （例如预设少收录了 8886 kHz，而系统表里有）
+        两者都为空时才报错。
+
+        返回 (频道列表, 来源说明, 波段名)
+        """
+        preset = presets.channels_in_window(self.cfg.effective_freqs(),
+                                            fc, half)
+        table = presets.channels_in_window(presets.all_channels(), fc, half)
+        merged = sorted(set(preset) | set(table))
+        band = presets.band_of(fc)
+        if not merged:
+            return [], "无匹配", band
+        added = sorted(set(table) - set(preset))
+        if not preset:
+            src = "全波段频道表（按中心频率自动匹配波段）"
+        elif added:
+            src = f"频道预设 + 系统表补 {len(added)} 个"
+        else:
+            src = "选定的频道预设"
+        return merged, src, band
+
+    def auto_tune_rsp(self):
+        """按当前中心频率所在波段，一键配置最优中心频率与模拟带宽。
+
+        规则（均有实测依据）：
+          · 中心频率落在两频道之间，距最近频道 ≥ 9 kHz —— 避开零中频 DC 尖峰
+          · 带宽取能覆盖全部频道的最小档 —— 带宽越窄噪声越少、SNR 越好
+          · AGC 打开（50 Hz）—— 关闭 AGC 用最大增益会过载，对比度从 34dB 掉到 2dB
+        """
+        try:
+            fc = float(self.var_rsp_freq.get())
+        except Exception:
+            fc = self.cfg.rsp_freq_khz
+        sband, scenter = self._suggest_center(fc)
+        if sband is None:
+            self.log("[rsp] 自动优化失败：无法判断波段")
+            return
+        chs = dict(presets.band_channels()).get(sband, [])
+        bw = presets.recommend_bw_khz(chs, scenter)
+        dec = presets.recommend_decim(self.cfg.rsp_rate, bw, chs, scenter)
+        self.var_rsp_freq.set(f"{scenter:g}")
+        self.var_rsp_bw.set(str(bw))
+        self.var_rsp_decim.set(str(dec))
+        # AGC 打开（对应 "50 Hz"）
+        for k, v in rsp.AGC_OPTIONS.items():
+            if v == 2:
+                self.var_rsp_agc.set(k)
+        self._read_rsp_cfg()
+        self._update_rsp_hint()
+        fse = self.cfg.rsp_rate / max(dec, 1)
+        self.log(f"[rsp] 自动优化 → {sband} 段：中心 {scenter} kHz，"
+                 f"带宽 {bw} kHz，抽取 {dec}×（输出 {fse/1e3:.0f} kSPS，"
+                 f"数据率降至 1/{dec}），AGC 50Hz；覆盖 {len(chs)} 个频道")
+
+    def _update_rsp_hint(self, note=None):
+        """面板底部提示：API 状态 / 覆盖范围 / 频道匹配 / 调制模式说明。"""
+        avail, msg = (False, "")
+        try:
+            avail, msg = rsp.api_info()
+        except Exception as e:
+            msg = str(e)
+        parts = []
+        parts.append(("✔ " + msg) if avail else ("✘ " + (msg or "SDRplay API 不可用")))
+        try:
+            fs = int(float(self.var_rsp_rate.get()))
+            try:
+                dec = max(1, int(float(self.var_rsp_decim.get())))
+            except Exception:
+                dec = 1
+            fs_eff = fs / float(dec)          # 抽取后的实际输出采样率
+            half = fs_eff / 2.0 / 1e3
+            try:
+                fc = float(self.var_rsp_freq.get())
+            except Exception:
+                fc = self.cfg.rsp_freq_khz
+            chans, src, band = self._rsp_pick_channels(fc, half)
+            bandtxt = f"（{band} 段）" if band else ""
+            rate_txt = (f"{fs_eff/1e3:.0f} kSPS"
+                        + (f"，抽取 {dec}×（数据率降至 1/{dec}）"
+                           if dec > 1 else ""))
+            if chans:
+                parts.append(f"输出 {rate_txt}{bandtxt}，覆盖 "
+                             f"{fc-half:.0f}–{fc+half:.0f} kHz，"
+                             f"将监听 {len(chans)} 个频道："
+                             f"{', '.join(f'{c:g}' for c in chans[:8])}"
+                             f"{' …' if len(chans) > 8 else ''}")
+                if src != "选定的频道预设":
+                    parts.append(f"ℹ 频道来源：{src}")
+                # 带宽建议：越窄噪声越少
+                rec_bw = presets.recommend_bw_khz(chans, fc)
+                try:
+                    cur_bw = int(float(self.var_rsp_bw.get()))
+                except Exception:
+                    cur_bw = self.cfg.rsp_bw_khz
+                halfspan = max(abs(f - fc) for f in chans)
+                if cur_bw < rec_bw:
+                    parts.append(f"⚠ 带宽 {cur_bw} kHz 不够覆盖频道"
+                                 f"（需 ≥ {rec_bw} kHz，最远偏离中心 "
+                                 f"{halfspan:.0f} kHz）")
+                elif cur_bw > rec_bw:
+                    parts.append(f"ℹ 带宽可收窄到 {rec_bw} kHz —— "
+                                 f"更窄噪声更少、SNR 更好")
+                # 抽取是否过头：抽取后采样率必须 ≥ 模拟带宽
+                if fs_eff < cur_bw * 1e3:
+                    rec_d = presets.recommend_decim(fs, cur_bw, chans, fc)
+                    parts.append(f"⚠ 抽取 {dec}× 过头：输出 {fs_eff/1e3:.0f} kSPS "
+                                 f"< 带宽 {cur_bw} kHz，会混叠 —— 建议改 "
+                                 f"{rec_d}×")
+            else:
+                sband, scenter = self._suggest_center(fc)
+                tip = (f"建议把中心频率设到 {sband} 段的 {scenter} kHz"
+                       if sband and scenter else "请把中心频率设到 HFDL 波段中间")
+                parts.append(f"⚠ 覆盖 {fc-half:.0f}–{fc+half:.0f} kHz 内没有 "
+                             f"HFDL 频道 —— {tip}")
+            # 零中频 DC 尖峰警告：频道落在本振附近会被淹没
+            clash = [f for f in chans if abs(f - fc) <= 8.0]
+            if clash:
+                parts.append(f"⚠ 中心频率与频道 "
+                             f"{', '.join(f'{c:g}' for c in clash)} 重合 —— "
+                             f"零中频 DC 尖峰(约13kHz宽,+30dB)会淹没它，"
+                             f"请把中心频率在两个频道之间挪 9 kHz 以上")
+        except Exception:
+            pass
+        parts.append("调制自动：HFDL 300/600/1200/1800bps、BPSK/QPSK/8PSK 由 "
+                     "dumphfdl 识别，无需选择")
+        parts.append("⚠ gRdB 是增益衰减量：越 **小** 增益越 **大**，"
+                     "20 = 最大增益（解弱信号用 20；AGC 开启时此项由 AGC 接管）")
+        if note:
+            parts.append(note.replace("\n", " "))
+        self.lbl_rsp.config(text="\n".join(parts))
+
+    def _read_rsp_cfg(self):
+        """把 RSP 面板的值写进 cfg。"""
+        self.cfg.rsp_freq_khz = float(self.var_rsp_freq.get())
+        self.cfg.rsp_rate = int(float(self.var_rsp_rate.get()))
+        self.cfg.rsp_bw_khz = int(self.var_rsp_bw.get())
+        self.cfg.rsp_if_khz = next(
+            (k for k, v in self._rsp_if_choices.items()
+             if v == self.var_rsp_if.get()), 0)
+        self.cfg.rsp_agc = rsp.AGC_OPTIONS.get(self.var_rsp_agc.get(), 2)
+        self.cfg.rsp_gain_gr = int(float(self.var_rsp_gr.get()))
+        self.cfg.rsp_lna = int(float(self.var_rsp_lna.get()))
+        self.cfg.rsp_antenna = {"默认": -1, "A": 0, "B": 1, "C": 2}.get(
+            self.var_rsp_ant.get(), -1)
+        self.cfg.rsp_bias_t = bool(self.var_rsp_bias.get())
+        try:
+            self.cfg.rsp_decim = int(float(self.var_rsp_decim.get()))
+        except Exception:
+            self.cfg.rsp_decim = 1
+        # 从下拉框解析设备序号
+        m = self.var_rsp_dev.get()
+        if m.startswith("["):
+            try:
+                self.cfg.rsp_device_index = int(m[1:m.index("]")])
+            except Exception:
+                pass
 
     def apply_cfg(self):
         if not self._read_cfg():
@@ -697,12 +1094,14 @@ class HFDLApp:
         self.map.set_icon_size(self.cfg.icon_px)
         self.map.set_show_labels({"auto": "auto", "always": True,
                                   "never": False}.get(self.cfg.label_mode, "auto"))
+        self.map.set_flight_id_mode(self._fid_mode)
         self.map.refresh()
         self.log(f"[cfg] 已应用：后端={BACKEND_LABELS.get(self.cfg.backend, self.cfg.backend)} "
                  f"频道={len(self.cfg.oh_freqs)} 过期={self.cfg.stale_minutes}min "
                  f"航迹={self.cfg.track_minutes}min({self.cfg.track_minutes/60:.1f}h)"
                  f"{'' if self.cfg.track_show else ' 已隐藏'} "
-                 f"标签={self.cfg.label_mode} 图标={self.cfg.icon_px:g}px")
+                 f"标签={self.cfg.label_mode} 图标={self.cfg.icon_px:g}px "
+                 f"航班号={self.cfg.flight_id_mode}")
 
     def _apply_map_prefs(self):
         """窗口启动时把配置里的地图显示偏好同步到地图对象。"""
@@ -710,6 +1109,7 @@ class HFDLApp:
         self.map.set_track_minutes(self.cfg.track_minutes)
         self.map.set_show_tracks(self.cfg.track_show)
         self.map.set_icon_size(self.cfg.icon_px)
+        self.map.set_flight_id_mode(self._fid_mode)
         self.map.set_show_labels({"auto": "auto", "always": True,
                                   "never": False}.get(self.cfg.label_mode, "auto"))
 
@@ -734,6 +1134,7 @@ class HFDLApp:
             if fr.position_ok():
                 self.map.upsert(fr)
             self.log(self._frame_line(fr))
+        return n
 
     def _frame_line(self, fr):
         ts = datetime.fromtimestamp(fr.ts).strftime("%H:%M:%S")
@@ -798,6 +1199,93 @@ class HFDLApp:
                     f"· 采样率是否 ≥ {scb.MIN_SAMPLE_RATE} sps")
                 self.decoder = None
                 return
+        elif bk == BACKEND_OPENHFDL_RSP:
+            kind, path = ohc.find_dumphfdl(self.cfg.oh_binary)
+            if not kind:
+                messagebox.showwarning(
+                    "未找到 OpenHFDL",
+                    "RSP 直采仍需要 dumphfdl 解码。请先运行 "
+                    "build_openhfdl_wsl.sh 构建。")
+                return
+            if not self.rsp_devices:
+                self.refresh_rsp_devices()
+                if not self.rsp_devices:
+                    messagebox.showwarning(
+                        "未发现 RSP 设备",
+                        "没枚举到 RSP。请检查：\n"
+                        "· USB 是否插好（建议 USB3 口）\n"
+                        "· SDRplayAPIService 服务是否运行\n"
+                        "· 是否被 SDRuno 等程序占用")
+                    return
+            # 频道跟着波段走：预设落空则自动匹配全波段频道表
+            fs = float(self.cfg.rsp_rate)
+            dec = max(1, int(self.cfg.rsp_decim))
+            fs_eff = fs / float(dec)          # 抽取后的实际输出采样率
+            half = fs_eff / 2.0 / 1e3
+            fc = float(self.cfg.rsp_freq_khz)
+            chans, src, band = self._rsp_pick_channels(fc, half)
+            if not chans:
+                sband, scenter = self._suggest_center(fc)
+                tip = (f"建议改为中心频率 {scenter} kHz（{sband} 段）"
+                       if sband and scenter else "")
+                messagebox.showwarning(
+                    "频道不在带宽内",
+                    f"当前中心频率 {fc:g} kHz、采样率 {fs/1e6:g} MSPS，"
+                    f"覆盖 {fc-half:.0f}–{fc+half:.0f} kHz，\n"
+                    f"没有任何 HFDL 频道落在其中。\n\n{tip}\n\n"
+                    "各波段推荐中心频率（已避开零中频 DC 尖峰）：\n"
+                    "  8.9 MHz → 8903　　11.3 MHz → 11339\n"
+                    "  13.2 MHz → 13294　17.9 MHz → 17943\n"
+                    "  21.9 MHz → 21964")
+                return
+            if src != "选定的频道预设":
+                self.log(f"[rsp] 频道预设不在 {band or '该'} 波段，已自动改用"
+                         f"全波段频道表：{len(chans)} 个频道")
+            # 启动前把「会明显影响解码」的配置问题直接写进日志
+            clash = [f for f in chans if abs(f - fc) <= 9.0]
+            if clash:
+                self.log(f"[rsp] ⚠ 中心 {fc:g} kHz 与频道 "
+                         f"{', '.join(f'{c:g}' for c in clash)} 重合，"
+                         f"这些频道会被零中频 DC 尖峰淹没 —— "
+                         f"建议点「按当前波段自动优化」")
+            rec_bw = presets.recommend_bw_khz(chans, fc)
+            if self.cfg.rsp_bw_khz < rec_bw:
+                self.log(f"[rsp] ⚠ 带宽 {self.cfg.rsp_bw_khz} kHz 不足以覆盖频道"
+                         f"（建议 ≥ {rec_bw} kHz），部分频道会落在滤波器外")
+            elif self.cfg.rsp_bw_khz > rec_bw * 2:
+                self.log(f"[rsp] ℹ 带宽 {self.cfg.rsp_bw_khz} kHz 偏宽，"
+                         f"收窄到 {rec_bw} kHz 可减少噪声、提升 SNR")
+            if not self.cfg.rsp_agc:
+                self.log("[rsp] ⚠ AGC 关闭且为手动增益 —— 增益过大时会过载并"
+                         "严重恶化解码（实测对比度 34dB→2dB），建议开启 AGC")
+            self.decoder = rsp.RspDecoder(
+                self.cfg, on_frame=self._on_frame_threadsafe, on_log=self.log,
+                device_index=self.cfg.rsp_device_index,
+                sample_rate=self.cfg.rsp_rate,
+                freq_khz=self.cfg.rsp_freq_khz,
+                bw_khz=self.cfg.rsp_bw_khz,
+                if_khz=self.cfg.rsp_if_khz,
+                agc=self.cfg.rsp_agc,
+                gain_gr_db=self.cfg.rsp_gain_gr,
+                lna_state=self.cfg.rsp_lna,
+                antenna=(None if self.cfg.rsp_antenna < 0
+                         else self.cfg.rsp_antenna),
+                bias_t=self.cfg.rsp_bias_t,
+                decim=dec,
+                binary=path, kind=kind,
+                channels=chans)
+            if not self.decoder.start():
+                messagebox.showerror(
+                    "RSP 启动失败",
+                    "无法启动 RSP 采集/解码。请检查：\n"
+                    "· SDRplayAPIService 是否运行\n"
+                    "· 设备是否被其它程序占用\n"
+                    "· 采样率/带宽组合是否被设备支持\n"
+                    "（日志窗口有具体错误码与 API 位置）")
+                self.decoder = None
+                return
+            self.log(f"[rsp] 直采启动：{fc:g} kHz ±{half:.0f} kHz，"
+                     f"带内频道 {len(chans)} 个")
         elif bk == BACKEND_OPENHFDL_REMOTE:
             self.decoder = ohc.RemoteJsonFeed(
                 self.cfg.oh_remote_host, self.cfg.oh_remote_port,
@@ -871,10 +1359,13 @@ class HFDLApp:
 
     def _sim_loop(self):
         rng = random.Random(20240501)
+        # 用真实的航班号形态做演示：
+        #   · 国内 4 位航班号（MU5104 / CA1704 / CZ3502）—— IATA 形式，6 字符完整
+        #   · ICAO 三字呼号（AAL100 / SIA322 / LH400）—— 显示时自动转 IATA 码
         planes = [
-            dict(flight="MU510", reg="B2416", lat=31.2, lon=121.4, hdg=275.0, fl=350, spd=480),
-            dict(flight="CA981", reg="B2032", lat=40.0, lon=116.5, hdg=90.0, fl=370, spd=500),
-            dict(flight="CZ345", reg="B3062", lat=23.1, lon=113.3, hdg=210.0, fl=330, spd=460),
+            dict(flight="MU5104", reg="B2416", lat=31.2, lon=121.4, hdg=275.0, fl=350, spd=480),
+            dict(flight="CA1704", reg="B2032", lat=40.0, lon=116.5, hdg=90.0, fl=370, spd=500),
+            dict(flight="CZ3502", reg="B3062", lat=23.1, lon=113.3, hdg=210.0, fl=330, spd=460),
             dict(flight="LH400", reg="DABYA", lat=48.0, lon=8.0, hdg=250.0, fl=390, spd=520),
             dict(flight="QF12", reg="VHOQI", lat=-33.9, lon=151.2, hdg=310.0, fl=380, spd=510),
             dict(flight="AAL100", reg="N789AN", lat=40.6, lon=-73.8, hdg=75.0, fl=360, spd=495),
@@ -957,7 +1448,9 @@ class HFDLApp:
             for r in rows:
                 rid, ts_text, fl, reg, lat, lon, hdg, alt, mode, ok, txt = r
                 tree.insert("", "end", values=(
-                    ts_text, fl or "", reg or "",
+                    ts_text,
+                    display_flight_id(fl, self._fid_mode) if fl else "",
+                    reg or "",
                     f"{lat:.3f}" if lat is not None else "",
                     f"{lon:.3f}" if lon is not None else "",
                     f"{hdg:.0f}" if hdg is not None else "",
@@ -974,13 +1467,31 @@ class HFDLApp:
     # ==================================================================
     def _tick(self):
         try:
-            self._drain_frames()
-            self.map.prune()
-            self.map.refresh()
+            n_new = self._drain_frames()
+            dead = self.map.prune()
+            # 被选中的飞机已过期擦除 -> 同步取消高亮
+            if self.map.selected_key and self.map.selected_key in dead:
+                self.map.set_selected(None)
+                try:
+                    self.tree.selection_remove(*self.tree.selection())
+                except Exception:
+                    pass
+            # 地图重绘很贵（matplotlib 绘制期间长时间占住 GIL，会拖慢 RSP 写线程
+            # 并导致队列溢出）。因此：有新帧才立刻重绘；否则最多每 5 秒重绘一次
+            # （仅用于航迹随时间淡出）。
+            now = time.time()
+            need_draw = (n_new > 0 or (now - self._last_map_draw) >= 5.0)
+            if need_draw:
+                self.map.refresh()
+                self._last_map_draw = now
             self._refresh_tree()
             self._flush_log()
             st = self.decoder.stats if self.decoder else None
             extra = f" · 解码 {st['frames']} 帧" if st else ""
+            sel = self.map.selected_key
+            if sel:
+                fs = self.map.flights.get(sel)
+                extra += f" · 高亮 {fs.flight or sel}" if fs else ""
             self.lbl_status.config(
                 text=f"{self.map.counts()} 架飞机 · 入库 {self.store.count()} 条{extra}")
         except Exception:
@@ -988,20 +1499,81 @@ class HFDLApp:
         self.root.after(1000, self._tick)
 
     def _refresh_tree(self):
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
+        """刷新飞机列表。
+
+        以 flight key 作为行 iid，这样：
+          · 每秒只更新数值列，不重建行 —— 保留选中状态与滚动位置、不闪烁
+          · 行集合变化（新增/移除飞机）时才重建，并在重建后恢复选中
+        """
+        keep = self.map.selected_key
         now = time.time()
-        items = []
+        items, keys = [], []
         for st in self.map.flights.values():
-            items.append((st.flight or "?",
+            keys.append(st.key)
+            items.append((st.key,
+                          display_flight_id(st.flight, self._fid_mode),
+                          st.flight or "",          # 报文原始代码，便于核对来源
                           st.reg or "",
                           f"{st.lat:.2f},{st.lon:.2f}" if st.lat is not None else "—",
                           f"FL{st.altitude//100}" if st.altitude else "—",
                           f"{st.heading:.0f}°" if st.heading is not None else "—",
-                          f"{now - st.last_seen:.0f}"))
-        items.sort(key=lambda x: x[0])
-        for it in items:
-            self.tree.insert("", "end", values=it)
+                          _fmt_utc(st.last_seen)))     # 最新一帧的接收时刻(UTC)
+        keys.sort()
+        items.sort(key=lambda x: x[1])
+
+        if keys != self._tree_keys:
+            self._tree_keys = keys
+            for iid in self.tree.get_children():
+                self.tree.delete(iid)
+            for it in items:
+                self.tree.insert("", "end", iid=it[0], values=it[1:])
+            if keep and keep in keys:
+                try:
+                    self.tree.selection_set(keep)
+                    self.tree.see(keep)
+                except Exception:
+                    pass
+        else:
+            for it in items:
+                try:
+                    self.tree.item(it[0], values=it[1:])
+                except Exception:
+                    pass
+        self._apply_tree_highlight()
+
+    def _apply_tree_highlight(self):
+        """让列表选中行与地图高亮保持一致（含底色标记）。"""
+        sel = self.tree.selection()
+        key = sel[0] if sel else None
+        for iid in self.tree.get_children():
+            try:
+                self.tree.item(iid, tags=("sel",) if iid == key else ())
+            except Exception:
+                pass
+
+    def _on_tree_select(self, _ev=None):
+        """列表选中某航班 -> 地图上高亮该飞机及其航迹。"""
+        sel = self.tree.selection()
+        key = sel[0] if sel else None
+        self.map.set_selected(key)
+        self._apply_tree_highlight()
+        st = self.map.flights.get(key) if key else None
+        if st is not None:
+            self.log(f"[map] 高亮航班 {st.flight or key}")
+        self.map.refresh()
+
+    def _on_tree_activate(self, _ev=None):
+        """双击某航班 -> 地图居中并放大，便于看清航迹。"""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        key = sel[0]
+        st = self.map.flights.get(key)
+        if st is None or st.lat is None:
+            return
+        cur = self.map._xlim[1] - self.map._xlim[0]
+        self.map.center_on(key, span=min(cur, 20.0))
+        self.log(f"[map] 已定位到 {st.flight or key}")
 
     # ==================================================================
     def _on_close(self):

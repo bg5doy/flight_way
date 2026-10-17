@@ -204,6 +204,103 @@ def stations_on_freq(stations, freq_khz, tol=0.01):
             if any(abs(f - freq_khz) <= tol for f in st["freqs"])]
 
 
+def all_channels(stations=None):
+    """全部已知 HFDL 频率（跨所有波段），排序去重。"""
+    if stations is None:
+        stations = load_systable()
+    s = set()
+    for st in stations:
+        s.update(st["freqs"])
+    return sorted(s)
+
+
+def channels_in_window(freqs_khz, center_khz, half_khz, margin=1.0):
+    """返回落在 center ± half 窗口内的频率。
+
+    margin 留 1 kHz 余量：dumphfdl 对"频道距中心 ≤ 采样率/2"是硬边界，
+    卡在边界上会被判为超距而退出。
+    """
+    return sorted({f for f in freqs_khz
+                   if abs(f - center_khz) <= half_khz - margin})
+
+
+def recommend_center_khz(freqs_khz, min_clearance=9.0):
+    """为给定频道集合挑一个中心频率（SDR 本振）。
+
+    约束：
+      · 距最近频道 ≥ min_clearance —— 零中频 SDR 在本振处有约 13 kHz 宽的
+        DC 尖峰，频道贴太近会被淹没（实测 +30 dB）
+      · 在上述前提下尽量把所有频道放在窗口中央
+
+    返回 kHz（int）；频道为空返回 None。
+    """
+    ch = sorted(set(freqs_khz))
+    if not ch:
+        return None
+    lo, hi = ch[0], ch[-1]
+    cands = []
+    for cand in range(int(lo) - 30, int(hi) + 31):
+        d = min(abs(cand - c) for c in ch)
+        if d >= min_clearance:
+            cands.append((max(abs(lo - cand), abs(hi - cand)), -d, cand))
+    if not cands:
+        return int(round((lo + hi) / 2.0))
+    cands.sort()
+    return cands[0][2]
+
+
+# RSP 可用的模拟带宽（kHz），从小到大
+RSP_BW_STEPS = [200, 300, 600, 1536, 5000, 6000, 7000, 8000]
+
+
+def recommend_bw_khz(freqs_khz, center_khz, margin_khz=20.0):
+    """推荐模拟带宽：覆盖所有频道所需的最小带宽。
+
+    模拟带宽越窄，进入 ADC 的噪声越少、SNR 越好（实测 200/300 kHz 比
+    1536 kHz 的突发对比度高约 1 dB）；但必须覆盖全部频道的频偏范围。
+    """
+    ch = list(freqs_khz or [])
+    if not ch:
+        return 1536
+    half = max(abs(f - center_khz) for f in ch)
+    need = 2.0 * (half + margin_khz / 2.0)
+    for bw in RSP_BW_STEPS:
+        if bw >= need:
+            return bw
+    return RSP_BW_STEPS[-1]
+
+
+DECIM_STEPS = [1, 2, 4, 8, 16, 32]
+
+
+def recommend_decim(sample_rate, bw_khz, freqs_khz=None, center_khz=None,
+                    max_decim=16):
+    """推荐 RSP 硬件抽取倍数（在不损伤信号的前提下尽量降低数据率）。
+
+    两个硬约束：
+      · 抽取后采样率必须 ≥ 模拟带宽（否则带外信号混叠进来）
+      · 抽取后采样率的一半必须 > 最远频道偏移（dumphfdl 要求频道落在
+        采样率一半以内）
+    实测：抽取 1/2/4/8/16/32 均可用，突发对比度 33.8–37.9 dB 与不抽取
+    （35.8 dB）相当，即抽取不损伤解码；数据率按倍数下降。
+    """
+    fs = float(sample_rate or 2000000)
+    bw = float(bw_khz or 200)
+    # 注意统一单位：fs 是 Hz，bw / 频道偏移是 kHz → 折算成 Hz 再比较
+    need_hz = bw * 1e3
+    ch = list(freqs_khz or [])
+    if ch and center_khz is not None:
+        need_hz = max(need_hz,
+                      (2.0 * max(abs(f - center_khz) for f in ch) + 2.0) * 1e3)
+    best = 1
+    for d in DECIM_STEPS:
+        if d > max_decim:
+            break
+        if fs / d >= need_hz:
+            best = d
+    return best
+
+
 # ----------------------------------------------------------------------
 # 常用解码预设
 # ----------------------------------------------------------------------

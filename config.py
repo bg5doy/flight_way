@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, asdict
 BACKEND_OPENHFDL_LOCAL = "openhfdl-local"     # I/Q 录制文件 → dumphfdl（离线解码）
 BACKEND_OPENHFDL_SOUNDCARD = "openhfdl-soundcard"  # 声卡/ SDR IQ OUT → I/Q → dumphfdl
 BACKEND_OPENHFDL_REMOTE = "openhfdl-remote"   # 连接远端 dumphfdl 的 TCP 输出
+BACKEND_OPENHFDL_RSP = "openhfdl-rsp"         # SDRplay RSP 直采 I/Q → dumphfdl
 
 # 已移除的后端（保留常量仅供读取旧配置时兼容，界面不再提供）：
 #   · builtin-soundcard：内置教学解调与真实 HFDL 非位级兼容，解不出实际报文
@@ -25,6 +26,7 @@ BACKEND_LABELS = {
     BACKEND_OPENHFDL_LOCAL: "OpenHFDL + I/Q 文件（离线解码）",
     BACKEND_OPENHFDL_SOUNDCARD: "OpenHFDL + 声卡桥接（声卡 / SDR IQ OUT）",
     BACKEND_OPENHFDL_REMOTE: "OpenHFDL 远程解码 (TCP JSON)",
+    BACKEND_OPENHFDL_RSP: "SDRplay RSP 直采 I/Q（SDRplay API）",
 }
 
 # 常用 HFDL 默认配置（与 hfdl_presets 保持一致，避免循环导入故此处内联）
@@ -122,8 +124,45 @@ class HfdlConfig:
     track_show: bool = True         # 地图上显示历史航迹
     label_mode: str = "auto"        # 航班标签：auto=按缩放自动 / always / never
     icon_px: float = 15.0           # 飞机图标像素尺寸（全球视图基准）
+    # 航班号显示模式：HFDL 报文里的 flight_id 是机组自填标识，需转成 IATA 码
+    # 才对应商业航班号（详见 flight_id.py）
+    #   iata = 转成 IATA 商业航班号后显示（如 CCA981→CA981、CES510→MU510）【默认】
+    #   raw  = 显示报文原文（如 CCA981 / AAL100），便于和原始报文核对
+    #   both = 两者都显示（如 CA981 (CCA981)）
+    # 注意：HFDL flight_id 只有 6 字符，ICAO 三字码最多带 3 位数字，
+    #     国内 4 位航班号（CA1704/MU5104）只在 IATA 形式下完整。
+    flight_id_mode: str = "iata"
     db_path: str = "hfdl_flights.db"
     station_id: str = "STATION-1"
+
+    # ==================================================================
+    # 四、SDRplay RSP 直采（详见 sdr_rsp.py）
+    # ==================================================================
+    rsp_device_index: int = 0        # 枚举序号
+    rsp_freq_khz: float = 8903.0     # 中心频率：**必须避开 HFDL 频道**
+    #   零中频 SDR 在本振处有强 DC 尖峰（实测 +30dB、约 13kHz 宽），
+    #   频道若正好落在中心会被淹没。8903 kHz 不在 HFDL 频道表内。
+    rsp_rate: int = 2000000          # 采样率 Hz
+    # 模拟带宽：越窄进入 ADC 的噪声越少。21.9 段频道只占 ±36 kHz，
+    # 实测 BW=300 kHz 比 1536 kHz 突发对比度高约 1.5 dB。
+    # 换波段时界面会按频道跨度自动推荐（hfdl_presets.recommend_bw_khz）。
+    rsp_bw_khz: int = 300
+    rsp_if_khz: int = 0              # IF 模式：0=Zero-IF / 450 / 1620 / 2048
+    # 硬件抽取：API 内部数字滤波后降采样，数据率按倍数下降（USB/管道/Python 负载）。
+    # 实测 1/2/4/8/16/32 均可用，突发对比度 33.8–37.9 dB 与不抽取相当 → 不伤解码。
+    # 约束：抽取后采样率 ≥ 模拟带宽，且半带宽 > 最远频道偏移。
+    # 默认 8（2 MSPS → 250 kSPS），各波段的推荐值见 hfdl_presets.recommend_decim。
+    rsp_decim: int = 8
+    # ⚠ AGC 默认**开启**（50 Hz）：实测关闭 AGC 且用最大增益时 ADC 过载 6 次，
+    #   突发对比度从 34 dB 崩到 2 dB —— 直接毁掉解码。开启 AGC 让前端自动
+    #   选增益，对比度恢复 34 dB。手动调增益时才关闭 AGC。
+    rsp_agc: int = 2
+    # gRdB 是**增益衰减量**（SDRplay 语义）：越小增益越大，20 = 最大增益。
+    #   仅在 AGC 关闭时生效。实测 gRdB=20 时 RMS 2694，gRdB=40 只有 269。
+    rsp_gain_gr: int = 20
+    rsp_lna: int = 0                 # LNA 状态（RSP1 在 HF 只有 0..3）
+    rsp_antenna: int = -1            # 天线口：-1=默认 / 0/1/2 = A/B/C
+    rsp_bias_t: bool = False         # 偏置 T 供电
 
     def copy(self):
         return HfdlConfig(**asdict(self))
